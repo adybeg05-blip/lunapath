@@ -36,10 +36,23 @@ jobs:
           restore-keys: buildozer-
 
       - name: Build debug APK
-        run: buildozer -v android debug
+        shell: bash
+        run: buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Save build log
+        if: always()
+        run: tail -n 1500 build.log > build-tail.log || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: lunapath-apk
           path: bin/*.apk
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-tail.log
+          if-no-files-found: ignore
