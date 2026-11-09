@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>LunaPath</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: #0b1020; color: #e6e9f2; font-family: system-ui, sans-serif; padding: 12px; }
+  h1 { font-size: 20px; margin: 0 0 8px; font-weight: 500; }
+  .row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+  button { background: #1d2740; color: #e6e9f2; border: 1px solid #34426b; border-radius: 10px; padding: 12px 14px; font-size: 16px; flex: 1; }
+  button:active { background: #2c3a63; }
+  button.primary { background: #2f6fed; border-color: #2f6fed; }
+  button.danger { background: #8a3a2a; border-color: #8a3a2a; }
+  #status { font-size: 14px; color: #9aa6c7; margin: 4px 0; }
+  canvas { width: 100%; max-width: 420px; aspect-ratio: 1; display: block; margin: 8px auto; border: 1px solid #34426b; border-radius: 10px; background: #111829; }
+  #log { font-family: monospace; font-size: 12px; color: #9aa6c7; min-height: 48px; white-space: pre-wrap; }
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 300px; margin: 8px auto; }
+  .legend { font-size: 12px; color: #9aa6c7; text-align: center; }
+  #devices button { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<h1>LunaPath: mission control</h1>
+<div id="status">Not connected</div>
+
+<div id="connect">
+  <div class="row">
+    <button class="primary" id="btnFind">Find rover</button>
+    <button id="btnDemo">Demo mode</button>
+  </div>
+  <div id="devices"></div>
+</div>
+
+<canvas id="map" width="400" height="400"></canvas>
+<div class="legend">Tap a cell to set the target. Gray: unknown, green: free, red: obstacle.</div>
+
+<div class="row">
+  <button class="primary" id="btnAuto">Auto to target</button>
+  <button id="btnStop">Stop</button>
+  <button class="danger" id="btnReset">Reset map</button>
+</div>
+
+<div class="pad">
+  <span></span><button data-cmd="F">Forward</button><span></span>
+  <button data-cmd="L">Left</button><button data-cmd="S">Stop</button><button data-cmd="R">Right</button>
+  <span></span><button data-cmd="B">Back</button><span></span>
+</div>
+
+<div id="log"></div>
+
+<script>
+const N = 10, CELL_CM = 20, MAXD = 200, CMD_DELAY = 3000;
+const DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0];
+
+let grid, pose, target = null, path = [];
+let pending = 0, lastSend = 0, auto = false;
+let mode = null;
+
+function resetMap() {
+  grid = Array.from({ length: N }, () => Array(N).fill(0));
+  pose = { x: 5, y: 9, h: 0 };
+  grid[pose.y][pose.x] = 1;
+  target = null; path = []; pending = 0; auto = false;
+  draw();
+}
+
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+
+function say(t) { logEl.textContent = t + '\n' + logEl.textContent.split('\n').slice(0, 3).join('\n'); }
+function inB(x, y) { return x >= 0 && y >= 0 && x < N && y < N; }
+
+function draw() {
+  const c = canvas.width / N;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      ctx.fillStyle = ['#1b2230', '#2b4a3a', '#8a3a2a'][grid[y][x]];
+      ctx.fillRect(x * c + 1, y * c + 1, c - 2, c - 2);
+    }
+  }
+  if (path.length) {
+    ctx.strokeStyle = '#f0c040'; ctx.lineWidth = 3; ctx.setLineDash([6, 6]);
+    ctx.beginPath(); ctx.moveTo((pose.x + .5) * c, (pose.y + .5) * c);
+    path.forEach(p => ctx.lineTo((p.x + .5) * c, (p.y + .5) * c));
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  if (target) {
+    ctx.strokeStyle = '#f0c040'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc((target.x + .5) * c, (target.y + .5) * c, c * .3, 0, 7); ctx.stroke();
+  }
+  ctx.save();
+  ctx.translate((pose.x + .5) * c, (pose.y + .5) * c);
+  ctx.rotate(pose.h * Math.PI / 2);
+  ctx.fillStyle = '#4da3ff';
+  ctx.beginPath(); ctx.moveTo(0, -c * .35); ctx.lineTo(c * .28, c * .3); ctx.lineTo(-c * .28, c * .3); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function applyScan(vals) {
+  const { x, y, h } = pose;
+  vals.forEach(({ a, d }) => {
+    const bearing = (h * 90 + (90 - a)) * Math.PI / 180;
+    const dx = Math.sin(bearing), dy = -Math.cos(bearing);
+    const cells = Math.min(d, MAXD) / CELL_CM;
+    for (let s = 0.5; s < cells; s += 0.5) {
+      const cx = Math.round(x + dx * s), cy = Math.round(y + dy * s);
+      if (!inB(cx, cy)) break;
+      if (grid[cy][cx] !== 2) grid[cy][cx] = 1;
+    }
+    if (d < MAXD) {
+      const cx = Math.round(x + dx * cells), cy = Math.round(y + dy * cells);
+      if (inB(cx, cy) && !(cx === x && cy === y)) grid[cy][cx] = 2;
+    }
+  });
+  grid[y][x] = 1;
+}
+
+function plan() {
+  if (!target) return [];
+  const key = (x, y) => y * N + x;
+  const g = { [key(pose.x, pose.y)]: 0 }, prev = {}, open = [{ x: pose.x, y: pose.y, f: 0 }];
+  const hf = (x, y) => Math.abs(x - target.x) + Math.abs(y - target.y);
+  while (open.length) {
+    open.sort((p, q) => p.f - q.f);
+    const cur = open.shift();
+    if (cur.x === target.x && cur.y === target.y) {
+      const res = []; let k = key(cur.x, cur.y);
+      while (prev[k] !== undefined) { res.unshift({ x: k % N, y: Math.floor(k / N) }); k = prev[k]; }
+      return res;
+    }
+    for (let d = 0; d < 4; d++) {
+      const nx = cur.x + DX[d], ny = cur.y + DY[d];
+      if (!inB(nx, ny) || grid[ny][nx] === 2) continue;
+      const cost = g[key(cur.x, cur.y)] + (grid[ny][nx] === 0 ? 2 : 1);
+      if (g[key(nx, ny)] === undefined || cost < g[key(nx, ny)]) {
+        g[key(nx, ny)] = cost; prev[key(nx, ny)] = key(cur.x, cur.y);
+        open.push({ x: nx, y: ny, f: cost + hf(nx, ny) });
+      }
+    }
+  }
+  return null;
+}
+
+function stepAuto() {
+  if (!auto || pending > 0) return;
+  if (pose.x === target.x && pose.y === target.y) { auto = false; path = []; say('Target reached'); draw(); return; }
+  const p = plan();
+  if (!p) { auto = false; path = []; say('No path found'); draw(); return; }
+  path = p; draw();
+  const next = p[0];
+  const want = DX.findIndex((v, i) => v === next.x - pose.x && DY[i] === next.y - pose.y);
+  const diff = (want - pose.h + 4) % 4;
+  const cmds = diff === 1 ? ['R'] : diff === 3 ? ['L'] : diff === 2 ? ['R', 'R'] : [];
+  cmds.push('F');
+  cmds.forEach(sendCmd);
+}
+
+let sendChain = Promise.resolve();
+
+function sendCmd(c) {
+  pending++; lastSend = Date.now();
+  say('Sent ' + c + ' (will run in ~' + CMD_DELAY / 1000 + ' s)');
+  if (mode === 'demo') sim.receive(c);
+  else {
+    // one request at a time, so R,R,F always reach the rover in this order
+    sendChain = sendChain
+      .then(() => fetch('/api/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd: c }) }))
+      .then(r => r.json())
+      .then(j => { if (!j.ok) { pending = Math.max(0, pending - 1); say('Error: ' + j.error); } })
+      .catch(() => { pending = Math.max(0, pending - 1); say('Error: app server not responding'); });
+  }
+}
+
+function handleLine(line) {
+  const t = line.trim().split(/\s+/);
+  if (t[0] === 'SCAN') {
+    applyScan(t.slice(1).map(s => { const [a, d] = s.split(':').map(Number); return { a, d }; }));
+    draw(); stepAuto();
+  } else if (t[0] === 'EXEC') {
+    pending = Math.max(0, pending - 1);
+    if (t[1] === 'F') { const nx = pose.x + DX[pose.h], ny = pose.y + DY[pose.h]; if (inB(nx, ny)) { pose.x = nx; pose.y = ny; } }
+    if (t[1] === 'B') { const nx = pose.x - DX[pose.h], ny = pose.y - DY[pose.h]; if (inB(nx, ny)) { pose.x = nx; pose.y = ny; } }
+    if (t[1] === 'L') pose.h = (pose.h + 3) % 4;
+    if (t[1] === 'R') pose.h = (pose.h + 1) % 4;
+    draw();
+  } else if (t[0] === 'BLOCKED') {
+    pose.x -= DX[pose.h]; pose.y -= DY[pose.h];
+    const bx = pose.x + DX[pose.h], by = pose.y + DY[pose.h];
+    if (inB(bx, by)) grid[by][bx] = 2;
+    say('Path blocked'); draw();
+  } else if (t[0] === 'AVOID') {
+    pose.h = (pose.h + (t[1] === 'L' ? 3 : 1)) % 4;
+    say('Rover avoided an obstacle on its own (' + t[1] + ')'); draw();
+  }
+  if (pending > 0 && Date.now() - lastSend > 20000) pending = 0;
+}
+
+canvas.addEventListener('click', e => {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.floor((e.clientX - r.left) / r.width * N), y = Math.floor((e.clientY - r.top) / r.height * N);
+  if (!inB(x, y) || (x === pose.x && y === pose.y)) return;
+  target = { x, y }; path = []; say('Target: cell ' + x + ',' + y); draw();
+});
+
+document.getElementById('btnAuto').onclick = () => {
+  if (!mode) return say('Connect the rover or start demo mode first');
+  if (!target) return say('Pick a target on the map');
+  auto = true; say('Autopilot on'); stepAuto();
+};
+document.getElementById('btnStop').onclick = () => {
+  if (!mode) return say('Connect the rover or start demo mode first');
+  auto = false; sendCmd('S');
+};
+document.getElementById('btnReset').onclick = resetMap;
+document.querySelectorAll('[data-cmd]').forEach(b => b.onclick = () => {
+  if (!mode) return say('Connect the rover or start demo mode first');
+  auto = false; sendCmd(b.dataset.cmd);
+});
+
+function setMode(m, text) {
+  mode = m; statusEl.textContent = text;
+  document.getElementById('connect').style.display = 'none';
+}
+
+document.getElementById('btnFind').onclick = async () => {
+  const box = document.getElementById('devices');
+  try {
+    const j = await (await fetch('/api/devices')).json();
+    if (j.error) { box.textContent = 'Bluetooth error: ' + j.error + '. Allow the Bluetooth permission for the app and tap Find rover again.'; return; }
+    if (!j.devices.length) { box.textContent = 'No paired devices. Pair the HC-05 in your phone Bluetooth settings (PIN 1234 or 0000).'; return; }
+    box.innerHTML = '';
+    j.devices.forEach(d => {
+      const b = document.createElement('button');
+      b.textContent = d.name + ' (' + d.address + ')';
+      b.onclick = async () => {
+        statusEl.textContent = 'Connecting...';
+        const r = await (await fetch('/api/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: d.address }) })).json();
+        if (r.ok) { setMode('real', 'Connected: ' + d.name); setInterval(poll, 400); }
+        else statusEl.textContent = 'Error: ' + r.error;
+      };
+      box.appendChild(b);
+    });
+  } catch (e) { box.textContent = 'App server unavailable. Use demo mode.'; }
+};
+
+async function poll() {
+  try {
+    const j = await (await fetch('/api/poll')).json();
+    j.lines.forEach(handleLine);
+    if (!j.connected) statusEl.textContent = 'Connection lost';
+  } catch (e) {}
+}
+
+const sim = {
+  walls: [[4,6],[5,6],[6,6],[2,3],[3,3],[7,4],[8,4],[5,2],[6,2],[1,7]],
+  p: { x: 5, y: 9, h: 0 }, q: [], timer: null,
+  blocked(x, y) { return !inB(x, y) || this.walls.some(w => w[0] === x && w[1] === y); },
+  ray(a) {
+    const b = (this.p.h * 90 + (90 - a)) * Math.PI / 180;
+    for (let s = 0.25; s < 10; s += 0.25) {
+      if (this.blocked(Math.round(this.p.x + Math.sin(b) * s), Math.round(this.p.y - Math.cos(b) * s))) return Math.round(s * CELL_CM);
+    }
+    return MAXD;
+  },
+  receive(c) { this.q.push({ c, due: Date.now() + CMD_DELAY }); },
+  tick() {
+    const angles = [30, 60, 90, 120, 150], d = angles.map(a => this.ray(a));
+    handleLine('SCAN ' + angles.map((a, i) => a + ':' + d[i]).join(' '));
+    if (this.q.length && this.q[0].due <= Date.now()) {
+      const c = this.q.shift().c;
+      handleLine('EXEC ' + c);
+      if (c === 'F') {
+        const nx = this.p.x + DX[this.p.h], ny = this.p.y + DY[this.p.h];
+        if (d[2] < 20 || this.blocked(nx, ny)) handleLine('BLOCKED'); else { this.p.x = nx; this.p.y = ny; }
+      } else if (c === 'B') {
+        const nx = this.p.x - DX[this.p.h], ny = this.p.y - DY[this.p.h];
+        if (!this.blocked(nx, ny)) { this.p.x = nx; this.p.y = ny; }
+      } else if (c === 'L') this.p.h = (this.p.h + 3) % 4;
+      else if (c === 'R') this.p.h = (this.p.h + 1) % 4;
+    } else if (d[2] < 20 && !this.q.length) {
+      // reflex turn only while idle: with commands queued it would rotate the rover
+      // before they run and the autopilot would plan from a stale heading
+      const left = d[3] + d[4], right = d[0] + d[1];
+      handleLine('AVOID ' + (left > right ? 'L' : 'R'));
+      this.p.h = (this.p.h + (left > right ? 3 : 1)) % 4;
+    }
+  }
+};
+
+document.getElementById('btnDemo').onclick = () => {
+  setMode('demo', 'Demo mode: virtual rover');
+  resetMap();
+  sim.timer = setInterval(() => sim.tick(), 1500);
+};
+
+resetMap();
+</script>
+</body>
+</html>
