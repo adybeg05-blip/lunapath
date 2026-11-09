@@ -35,11 +35,12 @@ jobs:
           key: buildozer-${{ hashFiles('buildozer.spec') }}
           restore-keys: buildozer-
 
-      - name: Pre-download OpenSSL (openssl.org often returns 504 to CI)
+      - name: Pre-download OpenSSL (optional, build continues if it fails)
+        continue-on-error: true
         run: |
           d=.buildozer/android/platform/build-arm64-v8a/packages/openssl
           mkdir -p "$d"
-          curl -fL --retry 5 --retry-delay 5 -o "$d/openssl-3.3.1.tar.gz" \
+          curl -fL --retry 5 --retry-delay 5 --max-time 300 -o "$d/openssl-3.3.1.tar.gz" \
             https://github.com/openssl/openssl/releases/download/openssl-3.3.1/openssl-3.3.1.tar.gz
           touch "$d/.mark-openssl-3.3.1.tar.gz"
 
