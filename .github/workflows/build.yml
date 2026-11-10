@@ -44,8 +44,13 @@ jobs:
             https://github.com/openssl/openssl/releases/download/openssl-3.3.1/openssl-3.3.1.tar.gz
           touch "$d/.mark-openssl-3.3.1.tar.gz"
 
+      - name: Pin charset-normalizer (3.5+ ships an Android wheel that p4a cannot install)
+        run: echo "charset-normalizer<3.5" > "$GITHUB_WORKSPACE/pip-constraints.txt"
+
       - name: Build debug APK
         shell: bash
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/pip-constraints.txt
         run: |
           ok=0
           for i in 1 2 3; do
